@@ -3,6 +3,7 @@
 #include <getopt.h>
 #include <ctype.h>
 #include <string.h>
+#include <stdint.h>
 /* ******************************************************************
  ALTERNATING BIT AND GO-BACK-N NETWORK EMULATOR: VERSION 1.1  J.F.Kurose
 
@@ -60,17 +61,21 @@ float TIMEOUT = 1.0;
 /* Function declarations */
 
 void tolayer3(int,struct pkt);
+void tolayer5(int,char *);
 int checksum(char * data);
-
+void starttimer(int, float);
+void stoptimer(int);
 /* Helper functions */
 int checksum(char * data){
-	 int checksum=0;
+  int checksum=0;
+  /*
+
    uint32_t sum;
-   uint16_t seg1 = (uint16_t)(data & 0x0000000000000000ffff);
-   uint16_t seg2 = (uint16_t)((data >> 16 ) & 0x0000000000000000ffff);
-   uint16_t seg3 = (uint16_t)((data >> 32 ) & 0x0000000000000000ffff);
-   uint16_t seg4 = (uint16_t)((data >> 48 ) & 0x0000000000000000ffff);
-   uint16_t seg5 = (uint16_t)((data >> 64 ) & 0x0000000000000000ffff);
+   uint16_t seg1 = ((uint16_t)data & 0x0000000000000000ffff);
+   uint16_t seg2 = ((uint16_t)(data >> 16 ) & 0x0000000000000000ffff);
+   uint16_t seg3 = ((uint16_t)(data >> 32 ) & 0x0000000000000000ffff);
+   uint16_t seg4 = ((uint16_t)(data >> 48 ) & 0x0000000000000000ffff);
+   uint16_t seg5 = ((uint16_t)(data >> 64 ) & 0x0000000000000000ffff);
    sum = seg1 + seg2;
    if(sum>65535){
      sum = sum & 0x000000ff;
@@ -91,20 +96,71 @@ int checksum(char * data){
      sum = sum & 0x000000ff;
      sum += 0x00000001;
    }
+   */
+   for(int i = 0; i < 20; i++){
+     checksum += (int)data[i];
+   }
    return checksum;
 }
+
 /* called from layer 5, passed the data to be sent to other side */
-int seqno = 0;
+int seqnoA = 0;
+int acknoA = 0;
+int seqnoB = 0;
+int acknoB = 0;
+int expacknoA = 0;
+int expacknoB = 0;
+int expseqnoA = 0;
+int expseqnoB = 0;
+int waitingforackA = 0;
+int waitingforcallA = 0;
+int waitingforackB = 0;
+int waitingforcallB = 0;
+float timerA = 100.0;
+int A = 0;
+int B = 1;
+struct pkt packetA = {0};
+struct pkt packetB = {0};
+struct pkt ackpacketA = {0};
+struct pkt ackpacketB = {0};
+char ackdata[21]="00000000000000000001\0";
+int LOG = 1;
+int timerstate = 0; // 0 off, 1 on
+void checkandstarttimer(int AorB, float increment){
+  if(!timerstate){
+    starttimer(AorB, increment);
+    timerstate = 1;
+  }
+
+}
+void checkandstoptimer(int AorB){
+  if(timerstate){
+    stoptimer(AorB);
+    timerstate = 0;
+  }
+
+}
 void A_output(message)
   struct msg message;
 {
- 	struct pkt packet = {0};
-	packet.seqnum = seqno;
-	packet.acknum = 0;
-	packet.checksum = checksum(message);
-	strncpy(packet.payload, message.data, 20);
-	tolayer3(0,packet);
-	A_application++;
+  A_application++;
+  if(waitingforackA){
+    return;
+  }
+  waitingforcallA=0;
+	packetA.seqnum = seqnoA;
+	packetA.acknum = acknoA;
+  expacknoA = seqnoA;
+	packetA.checksum = checksum(message.data);
+	strncpy(packetA.payload, message.data, 20);
+	tolayer3(A,packetA);
+  waitingforackA = 1;
+  if(LOG)
+    fprintf(stderr,"Sending: data = %s, seq=%d, ack=%d, checksum=%d \n",packetA.payload,seqnoA, acknoA, packetA.checksum);
+  checkandstarttimer(A,timerA);
+
+  A_transport++;
+
 }
 
 void B_output(message)  /* need be completed only for extra credit */
@@ -117,19 +173,56 @@ void B_output(message)  /* need be completed only for extra credit */
 void A_input(packet)
   struct pkt packet;
 {
+  if(LOG){
+    fprintf(stderr,"Ack received\n");
+    fprintf(stderr,"Ack data: data = %s, seq=%d, ack=%d, checksum=%d \n",packet.payload,packet.seqnum, packet.acknum, packet.checksum);
+  }
+  if(waitingforcallA){
+    return;
+  }
+  if(strncmp(packet.payload,ackdata,20)!=0){
+    perror("Error: Not an ACK packet");
+    return;
+  }
+  if(checksum(packet.payload)!=packet.checksum){
+    perror("Error: checksum does not match");
+    return;
+  }
+  if(packet.acknum != expacknoA){
+    perror("Error: not the expected sequence number");
+    return;
+  }
+  if(LOG){
+    fprintf(stderr,"Stopping timer\n");
+  }
 
+  checkandstoptimer(A);
+
+  seqnoA = (seqnoA+1)%2;
+  waitingforackA=0;
+  waitingforcallA=1;
 }
 
 /* called when A's timer goes off */
 void A_timerinterrupt()
 {
-
+  checkandstoptimer(A);
+  if(LOG){
+    fprintf(stderr,"Timer fired\n");
+    fprintf(stderr,"Sending due to TO: data = %s, seq=%d, ack=%d, checksum=%d \n",packetA.payload,packetA.seqnum, packetA.acknum, packetA.checksum);
+  }
+  tolayer3(A,packetA);
+  A_transport++;
+  waitingforackA = 1;
+  checkandstarttimer(A,timerA);
 }
 
 /* the following routine will be called once (only) before any other */
 /* entity A routines are called. You can use it to do any initialization */
 void A_init()
 {
+    waitingforcallA = 1;
+    waitingforackA = 0;
 }
 
 
@@ -139,17 +232,57 @@ void A_init()
 void B_input(packet)
   struct pkt packet;
 {
+  if(LOG){
+    fprintf(stderr,"AT B\n");
+    fprintf(stderr,"Data received at B: data = %s, seq=%d, ack=%d, checksum=%d \n",packet.payload,packet.seqnum, packet.acknum, packet.checksum);
+  }
+  B_transport++;
+  if(!waitingforcallB){
+    return;
+  }
+
+  int recvseq = packet.seqnum;
+  int recvchecksum = packet.checksum;
+  char recvdata[20];
+  if(recvseq != expseqnoB){
+    perror("Error: wrong sequence no");
+    return;
+  }
+  strncpy(recvdata, packet.payload, 20);
+  if(recvchecksum != checksum(recvdata)){
+    perror("Error in data stream");
+    return;
+  }else{
+    waitingforcallB=0;
+    tolayer5(B,recvdata);
+    B_application++;
+    // create an ACK packet. Define ACK as a packet with unit(LSB) bit set to 1
+    // to  1
+
+    ackpacketB.seqnum = seqnoB;
+    ackpacketB.acknum = recvseq;
+    expseqnoB = (expseqnoB+1)%2;
+    ackpacketB.checksum = checksum(ackdata);
+    strncpy(ackpacketB.payload,ackdata,20);
+    tolayer3(B,ackpacketB);
+    seqnoB = (seqnoB+1)%2;
+    waitingforcallB=1;
+  }
 }
 
 /* called when B's timer goes off */
 void B_timerinterrupt()
 {
+
 }
 
 /* the following rouytine will be called once (only) before any other */
 /* entity B routines are called. You can use it to do any initialization */
 void B_init()
 {
+  waitingforcallB = 1;
+  waitingforackB = -1;
+  expseqnoB=0;
 }
 
 /*****************************************************************
