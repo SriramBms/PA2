@@ -53,7 +53,7 @@ int B_transport = 0;
  * Do NOT change the name/declaration of these variables
  * They are set to zero here. You will need to set them (except WINSIZE) to some proper values.
  * */
-float TIMEOUT = 1.0;
+float TIMEOUT = 20.0;
 //int WINSIZE;         //Not applicable to ABT
 //int SND_BUFSIZE = 0; //Not applicable to ABT
 //int RCV_BUFSIZE = 0; //Not applicable to ABT
@@ -104,6 +104,13 @@ int checksum(char * data){
 }
 
 /* called from layer 5, passed the data to be sent to other side */
+#define CALL0 0
+#define CALL1 1
+#define ACK0 2
+#define ACK1 3
+#define WAIT0 4
+#define WAIT1 5
+
 int seqnoA = 0;
 int acknoA = 0;
 int seqnoB = 0;
@@ -116,16 +123,19 @@ int waitingforackA = 0;
 int waitingforcallA = 0;
 int waitingforackB = 0;
 int waitingforcallB = 0;
-float timerA = 100.0;
+float timerA = TIMEOUT;
 int A = 0;
 int B = 1;
 struct pkt packetA = {0};
 struct pkt packetB = {0};
 struct pkt ackpacketA = {0};
-struct pkt ackpacketB = {0};
-char ackdata[21]="00000000000000000001\0";
+struct pkt ackpacketB0 = {0};
+struct pkt ackpacketB1 = {0};
+char ackdata[25]="0000000000000000000100";
 int LOG = 1;
 int timerstate = 0; // 0 off, 1 on
+int state = CALL0; // waiting for call 0 or call 1 or (2 and 3) for ack 0 and 1
+int stateB = WAIT0;
 void checkandstarttimer(int AorB, float increment){
   if(!timerstate){
     starttimer(AorB, increment);
@@ -144,22 +154,34 @@ void A_output(message)
   struct msg message;
 {
   A_application++;
-  if(waitingforackA){
+  // Encapsulation
+  fprintf(stderr, ">>> A_output: state = %d\n\n", state);
+  if(state==CALL0){
+	   packetA.seqnum = 0;
+     expacknoA = 0;
+  }else if(state == CALL1){
+    packetA.seqnum = 1;
+    expacknoA = 1;
+  }else{
+    fprintf(stderr,"A_output: Illegal state, state=%d \n", state);
     return;
   }
-  waitingforcallA=0;
-	packetA.seqnum = seqnoA;
 	packetA.acknum = acknoA;
-  expacknoA = seqnoA;
 	packetA.checksum = checksum(message.data);
 	strncpy(packetA.payload, message.data, 20);
 	tolayer3(A,packetA);
-  waitingforackA = 1;
-  if(LOG)
-    fprintf(stderr,"Sending: data = %s, seq=%d, ack=%d, checksum=%d \n",packetA.payload,seqnoA, acknoA, packetA.checksum);
-  checkandstarttimer(A,timerA);
-
   A_transport++;
+  if(LOG)
+    fprintf(stderr,"\nSending: data = %s, seq=%d, ack=%d, checksum=%d \n\n",packetA.payload,packetA.seqnum, packetA.acknum, packetA.checksum);
+  checkandstarttimer(A,timerA);
+  if(state == CALL0){
+    state=ACK0;
+  }else if(state == CALL1){
+    state=ACK1;
+  }else{
+    fprintf(stderr,"A_output: Illegal state, state=%d \n", state);
+    return;
+  }
 
 }
 
@@ -174,10 +196,11 @@ void A_input(packet)
   struct pkt packet;
 {
   if(LOG){
-    fprintf(stderr,"Ack received\n");
+    fprintf(stderr,"A_input: Packet received\n");
     fprintf(stderr,"Ack data: data = %s, seq=%d, ack=%d, checksum=%d \n",packet.payload,packet.seqnum, packet.acknum, packet.checksum);
   }
-  if(waitingforcallA){
+  if(!(state == ACK0 || state == ACK1)){
+    fprintf(stderr,"A_input: Illegal state, state=%d \n", state);
     return;
   }
   if(strncmp(packet.payload,ackdata,20)!=0){
@@ -197,15 +220,22 @@ void A_input(packet)
   }
 
   checkandstoptimer(A);
+  if(state == ACK0){
+    state = CALL1;
+  }else if(state == ACK1){
+    state = CALL0;
+  }
 
-  seqnoA = (seqnoA+1)%2;
-  waitingforackA=0;
-  waitingforcallA=1;
+
 }
 
 /* called when A's timer goes off */
 void A_timerinterrupt()
 {
+  if(!(state != ACK0 || state != ACK1)){
+    fprintf(stderr,"A_output: Illegal state, state=%d \n", state);
+    return;
+  }
   checkandstoptimer(A);
   if(LOG){
     fprintf(stderr,"Timer fired\n");
@@ -213,7 +243,6 @@ void A_timerinterrupt()
   }
   tolayer3(A,packetA);
   A_transport++;
-  waitingforackA = 1;
   checkandstarttimer(A,timerA);
 }
 
@@ -223,6 +252,7 @@ void A_init()
 {
     waitingforcallA = 1;
     waitingforackA = 0;
+    state = CALL0;
 }
 
 
@@ -237,37 +267,50 @@ void B_input(packet)
     fprintf(stderr,"Data received at B: data = %s, seq=%d, ack=%d, checksum=%d \n",packet.payload,packet.seqnum, packet.acknum, packet.checksum);
   }
   B_transport++;
-  if(!waitingforcallB){
-    return;
-  }
-
   int recvseq = packet.seqnum;
   int recvchecksum = packet.checksum;
   char recvdata[20];
-  if(recvseq != expseqnoB){
-    perror("Error: wrong sequence no");
-    return;
-  }
   strncpy(recvdata, packet.payload, 20);
-  if(recvchecksum != checksum(recvdata)){
-    perror("Error in data stream");
-    return;
-  }else{
-    waitingforcallB=0;
+  if(LOG)
+  fprintf(stderr,"At B, expseqnoB= %d , expchecksum = %d , recvseq = %d, recvchecksum = %d \n",expseqnoB, checksum(recvdata), recvseq, recvchecksum);
+  if(recvseq != expseqnoB || recvchecksum != checksum(recvdata) ){
+    if(stateB == WAIT0){
+      tolayer3(B,ackpacketB1);
+      if(LOG)
+        fprintf(stderr,"At B, error: Sending: data = %s, seq=%d, ack=%d, checksum=%d \n\n",ackpacketB1.payload,ackpacketB1.seqnum, ackpacketB1.acknum, ackpacketB1.checksum);
+      return;
+    }else{
+      tolayer3(B,ackpacketB0);
+      if(LOG)
+        fprintf(stderr,"At B, error: Sending: data = %s, seq=%d, ack=%d, checksum=%d \n\n",ackpacketB0.payload,ackpacketB0.seqnum, ackpacketB0.acknum, ackpacketB0.checksum);
+
+      return;
+    }
+  }
     tolayer5(B,recvdata);
     B_application++;
     // create an ACK packet. Define ACK as a packet with unit(LSB) bit set to 1
     // to  1
 
-    ackpacketB.seqnum = seqnoB;
-    ackpacketB.acknum = recvseq;
+
+
+
+    if(stateB == WAIT0){
+      ackpacketB0.seqnum = seqnoB;
+      tolayer3(B,ackpacketB0);
+      if(LOG)
+        fprintf(stderr,"At B, success: Sending B0: data = %s, seq=%d, ack=%d, checksum=%d \n\n",ackpacketB0.payload,ackpacketB0.seqnum, ackpacketB0.acknum, ackpacketB0.checksum);
+      stateB = WAIT1;
+    }else{
+      ackpacketB1.seqnum = seqnoB;
+      tolayer3(B,ackpacketB1);
+      if(LOG)
+        fprintf(stderr,"At B, success: Sending B1: data = %s, seq=%d, ack=%d, checksum=%d \n\n",ackpacketB1.payload,ackpacketB1.seqnum, ackpacketB1.acknum, ackpacketB1.checksum);
+      stateB = WAIT0;
+    }
     expseqnoB = (expseqnoB+1)%2;
-    ackpacketB.checksum = checksum(ackdata);
-    strncpy(ackpacketB.payload,ackdata,20);
-    tolayer3(B,ackpacketB);
     seqnoB = (seqnoB+1)%2;
-    waitingforcallB=1;
-  }
+
 }
 
 /* called when B's timer goes off */
@@ -283,6 +326,13 @@ void B_init()
   waitingforcallB = 1;
   waitingforackB = -1;
   expseqnoB=0;
+  stateB = WAIT0;
+  ackpacketB0.acknum = 0;
+  ackpacketB1.acknum = 1;
+  ackpacketB0.checksum = checksum(ackdata);
+  ackpacketB1.checksum = checksum(ackdata);
+  strncpy(ackpacketB0.payload,ackdata,20);
+  strncpy(ackpacketB1.payload,ackdata,20);
 }
 
 /*****************************************************************
